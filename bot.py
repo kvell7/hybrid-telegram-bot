@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import logging
 import os
@@ -29,11 +31,6 @@ from apscheduler.triggers.cron import CronTrigger
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError, SpreadsheetNotFound
 
-# Баны никогда не выполняются сами.
-# Даже при BANS_ENABLED=true бот сначала присылает кнопку.
-# Дополнительно без ALLOW_NON_TEST блокировка возможна только в группе,
-# в названии которой есть «тест» или test.
-
 USERNAME_RE = re.compile(r"^[a-z][a-z0-9_]{4,31}$")
 TELEGRAM_HEADERS = {
     "telegram",
@@ -45,43 +42,17 @@ TELEGRAM_HEADERS = {
 }
 EMPTY_MARKS = {"-", "—", "–", "нет", "н/д", "n/a", "na", "none", "."}
 WEEKDAY_MAP = {
-    "mon": "mon",
-    "monday": "mon",
-    "пн": "mon",
-    "понедельник": "mon",
-    "tue": "tue",
-    "tuesday": "tue",
-    "вт": "tue",
-    "вторник": "tue",
-    "wed": "wed",
-    "wednesday": "wed",
-    "ср": "wed",
-    "среда": "wed",
-    "thu": "thu",
-    "thursday": "thu",
-    "чт": "thu",
-    "четверг": "thu",
-    "fri": "fri",
-    "friday": "fri",
-    "пт": "fri",
-    "пятница": "fri",
-    "sat": "sat",
-    "saturday": "sat",
-    "сб": "sat",
-    "суббота": "sat",
-    "sun": "sun",
-    "sunday": "sun",
-    "вс": "sun",
-    "воскресенье": "sun",
+    "mon": "mon", "monday": "mon", "пн": "mon", "понедельник": "mon",
+    "tue": "tue", "tuesday": "tue", "вт": "tue", "вторник": "tue",
+    "wed": "wed", "wednesday": "wed", "ср": "wed", "среда": "wed",
+    "thu": "thu", "thursday": "thu", "чт": "thu", "четверг": "thu",
+    "fri": "fri", "friday": "fri", "пт": "fri", "пятница": "fri",
+    "sat": "sat", "saturday": "sat", "сб": "sat", "суббота": "sat",
+    "sun": "sun", "sunday": "sun", "вс": "sun", "воскресенье": "sun",
 }
 WEEKDAY_RU = {
-    "mon": "понедельник",
-    "tue": "вторник",
-    "wed": "среда",
-    "thu": "четверг",
-    "fri": "пятница",
-    "sat": "суббота",
-    "sun": "воскресенье",
+    "mon": "понедельник", "tue": "вторник", "wed": "среда",
+    "thu": "четверг", "fri": "пятница", "sat": "суббота", "sun": "воскресенье",
 }
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
@@ -96,6 +67,15 @@ dp = Dispatcher()
 
 class ConfigError(Exception):
     pass
+
+
+class SimpleUser:
+    def __init__(self, user_id, username, first_name, last_name):
+        self.id = user_id
+        self.username = username
+        self.first_name = first_name
+        self.last_name = last_name
+        self.is_bot = False
 
 
 @dataclass(repr=False)
@@ -156,12 +136,8 @@ class GroupReport:
     @property
     def known(self) -> int:
         return (
-            self.admins
-            + self.protected
-            + len(self.matched_names)
-            + len(self.no_username)
-            + len(self.grace)
-            + len(self.to_ban)
+            self.admins + self.protected + len(self.matched_names)
+            + len(self.no_username) + len(self.grace) + len(self.to_ban)
         )
 
 
@@ -202,15 +178,11 @@ def env_float(name: str, default: float) -> float:
 def parse_credentials(raw: str) -> dict:
     text = raw.lstrip("\ufeff").strip()
     if not text.startswith("{"):
-        raise ConfigError(
-            "GOOGLE_CREDENTIALS_JSON должен быть текстом файла-ключа и начинаться с символа {."
-        )
+        raise ConfigError("GOOGLE_CREDENTIALS_JSON должен начинаться с символа {.")
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ConfigError(
-            "Текст ключа Google не читается. Вставьте весь файл целиком, без кавычек вокруг него."
-        ) from exc
+        raise ConfigError("Текст ключа Google не читается.") from exc
     if not isinstance(data, dict) or "private_key" not in data or "client_email" not in data:
         raise ConfigError("В ключе Google нет client_email или private_key.")
     return data
@@ -222,15 +194,12 @@ def parse_group_ids(raw: str) -> list:
         part = part.strip()
         if not part:
             continue
-        try:
-            value = int(part)
-        except ValueError as exc:
-            raise ConfigError("GROUP_IDS должен содержать номера групп через запятую.") from exc
+        value = int(part)
         if value >= 0:
-            raise ConfigError("Номер группы должен начинаться с минуса, обычно с -100.")
+            raise ConfigError("Номер группы должен начинаться с минуса.")
         result.append(value)
     if not result:
-        raise ConfigError("Не задана ни одна группа в GROUP_IDS.")
+        raise ConfigError("Не задана ни одна группа.")
     return result
 
 
@@ -245,25 +214,26 @@ def load_timezone(name: str):
 def load_settings() -> Settings:
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
-        raise ConfigError("Не задан BOT_TOKEN. Его нужно вставить в настройки Coolify, а не в файлы и не в чат.")
+        raise ConfigError("Не задан BOT_TOKEN.")
     credentials_raw = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
     if not credentials_raw.strip():
-        raise ConfigError("Не задан GOOGLE_CREDENTIALS_JSON. Вставьте в Coolify весь текст файла-ключа.")
-    credentials = parse_credentials(credentials_raw)
-    timezone_name = os.getenv("TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow"
-    timezone_name, tz = load_timezone(timezone_name)
+        raise ConfigError("Не задан GOOGLE_CREDENTIALS_JSON.")
+    timezone_name, tz = load_timezone(os.getenv("TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow")
     weekday_raw = os.getenv("CHECK_WEEKDAY", "mon").strip().lower() or "mon"
     if weekday_raw not in WEEKDAY_MAP:
-        raise ConfigError("CHECK_WEEKDAY должен быть, например, mon или понедельник.")
+        raise ConfigError("CHECK_WEEKDAY должен быть, например, mon.")
     hour = env_int("CHECK_HOUR", 10)
     minute = env_int("CHECK_MINUTE", 0)
     if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-        raise ConfigError("CHECK_HOUR должен быть от 0 до 23, CHECK_MINUTE — от 0 до 59.")
+        raise ConfigError("Неправильное время проверки.")
     report_chat_id = env_int("REPORT_CHAT_ID", 791088587)
     if report_chat_id < 0:
-        raise ConfigError("REPORT_CHAT_ID — это личный номер, без минуса.")
-    skip_raw = os.getenv("SHEETS_SKIP", "")
-    skip_sheets = {part.strip().lower() for part in skip_raw.replace(";", ",").split(",") if part.strip()}
+        raise ConfigError("REPORT_CHAT_ID должен быть без минуса.")
+    skip_sheets = {
+        part.strip().lower()
+        for part in os.getenv("SHEETS_SKIP", "").replace(";", ",").split(",")
+        if part.strip()
+    }
     whitelist = set()
     for part in os.getenv("WHITELIST_USERNAMES", "").replace(";", ",").split(","):
         username = normalize_username(part)
@@ -271,11 +241,11 @@ def load_settings() -> Settings:
             whitelist.add(username)
     shrink_ratio = env_float("SHRINK_RATIO", 0.7)
     if not 0 < shrink_ratio < 1:
-        raise ConfigError("SHRINK_RATIO должен быть между 0 и 1, например 0.7.")
+        raise ConfigError("SHRINK_RATIO должен быть между 0 и 1.")
     return Settings(
         bot_token=token,
         spreadsheet_id=os.getenv("SPREADSHEET_ID", "1XpNFbygNmZwOqjJkTYSAhtu0BnQplMon1RXUKO3grsE").strip(),
-        google_credentials=credentials,
+        google_credentials=parse_credentials(credentials_raw),
         report_chat_id=report_chat_id,
         group_ids=parse_group_ids(os.getenv("GROUP_IDS", "-1004351827165")),
         bans_enabled=env_bool("BANS_ENABLED", False),
@@ -327,9 +297,7 @@ def normalize_username(raw):
     if value.startswith("@"):
         value = value[1:]
     value = value.strip().lower()
-    if USERNAME_RE.fullmatch(value):
-        return value
-    return None
+    return value if USERNAME_RE.fullmatch(value) else None
 
 
 def full_name(user):
@@ -340,20 +308,13 @@ def full_name(user):
 
 def format_user(username, user_id: int, name) -> str:
     nick = f"@{username}" if username else "без ника"
-    if name:
-        return f"{nick}, {name}, id {user_id}"
-    return f"{nick}, id {user_id}"
+    return f"{nick}, {name}, id {user_id}" if name else f"{nick}, id {user_id}"
 
 
 def is_active(member) -> bool:
-    status = member.status
-    if status in {
-        ChatMemberStatus.MEMBER,
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.CREATOR,
-    }:
+    if member.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}:
         return True
-    if status == ChatMemberStatus.RESTRICTED:
+    if member.status == ChatMemberStatus.RESTRICTED:
         return bool(getattr(member, "is_member", False))
     return False
 
@@ -384,14 +345,12 @@ def in_grace(joined_at, hours: int) -> bool:
 
 
 def local_now_text() -> str:
-    settings = require_settings()
-    return datetime.now(settings.tz).strftime("%d.%m.%Y %H:%M")
+    return datetime.now(require_settings().tz).strftime("%d.%m.%Y %H:%M")
 
 
 def safe_err(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}"
-    secret_marks = ("PRIVATE KEY", "private_key", "BEGIN PRIVATE", "BOT_TOKEN")
-    if any(mark in text for mark in secret_marks):
+    if any(mark in text for mark in ("PRIVATE KEY", "private_key", "BEGIN PRIVATE", "BOT_TOKEN")):
         return type(exc).__name__
     return text[:500]
 
@@ -421,14 +380,7 @@ def init_db(path: str) -> None:
             )
             """
         )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
+        connection.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         connection.commit()
     DB = connection
 
@@ -442,18 +394,13 @@ def require_db() -> sqlite3.Connection:
 def meta_get(key: str):
     with db_lock:
         row = require_db().execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-    if row is None:
-        return None
-    return str(row[0])
+    return None if row is None else str(row[0])
 
 
 def meta_set(key: str, value: str) -> None:
     with db_lock:
         require_db().execute(
-            """
-            INSERT INTO meta(key, value) VALUES(?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """,
+            "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
         require_db().commit()
@@ -470,12 +417,7 @@ def save_pending(token: str, bans: list) -> None:
         "token": token,
         "created": now_iso(),
         "items": [
-            {
-                "chat_id": item.chat_id,
-                "user_id": item.user_id,
-                "username": item.username,
-                "full_name": item.full_name,
-            }
+            {"chat_id": item.chat_id, "user_id": item.user_id, "username": item.username, "full_name": item.full_name}
             for item in bans
         ],
     }
@@ -509,14 +451,7 @@ def pending_to_bans(data) -> list:
     result = []
     for item in data.get("items", []):
         try:
-            result.append(
-                PlannedBan(
-                    int(item["chat_id"]),
-                    int(item["user_id"]),
-                    str(item["username"]),
-                    item.get("full_name"),
-                )
-            )
+            result.append(PlannedBan(int(item["chat_id"]), int(item["user_id"]), str(item["username"]), item.get("full_name")))
         except (KeyError, TypeError, ValueError):
             continue
     return result
@@ -542,21 +477,11 @@ def remember(chat_id: int, user, is_member: bool, is_admin, joined_now: bool) ->
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    chat_id,
-                    user.id,
-                    username,
-                    name,
-                    1 if is_member else 0,
-                    1 if is_admin else 0,
-                    moment,
-                    moment if joined_now else None,
-                    moment,
+                    chat_id, user.id, username, name, int(is_member), int(bool(is_admin)),
+                    moment, moment if joined_now else None, moment,
                 ),
             )
-            logging.info("Запомнила участника chat=%s user=%s", chat_id, user.id)
         else:
-            admin_value = row["is_admin"] if is_admin is None else int(is_admin)
-            joined_at = moment if joined_now else row["joined_at"]
             require_db().execute(
                 """
                 UPDATE members
@@ -565,27 +490,15 @@ def remember(chat_id: int, user, is_member: bool, is_admin, joined_now: bool) ->
                  WHERE chat_id = ? AND user_id = ?
                 """,
                 (
-                    username,
-                    name,
-                    1 if is_member else 0,
-                    admin_value,
-                    joined_at,
-                    moment,
-                    chat_id,
-                    user.id,
+                    username, name, int(is_member),
+                    row["is_admin"] if is_admin is None else int(is_admin),
+                    moment if joined_now else row["joined_at"], moment, chat_id, user.id,
                 ),
             )
         require_db().commit()
 
 
-def set_member_state(
-    chat_id: int,
-    user_id: int,
-    username,
-    name,
-    is_member: bool,
-    is_admin: bool,
-) -> None:
+def set_member_state(chat_id, user_id, username, name, is_member, is_admin) -> None:
     with db_lock:
         require_db().execute(
             """
@@ -603,8 +516,7 @@ def get_members(chat_id: int) -> list:
         rows = require_db().execute(
             """
             SELECT user_id, username, full_name, is_member, is_admin, joined_at
-              FROM members
-             WHERE chat_id = ?
+              FROM members WHERE chat_id = ?
              ORDER BY is_member DESC, username COLLATE NOCASE
             """,
             (chat_id,),
@@ -624,10 +536,7 @@ def read_spreadsheet(settings: Settings) -> SheetData:
     credentials = Credentials.from_service_account_info(settings.google_credentials, scopes=SCOPES)
     client = gspread.authorize(credentials)
     book = client.open_by_key(settings.spreadsheet_id)
-    usernames = set()
-    ok_sheets = []
-    skipped = []
-    invalid_examples = []
+    usernames, ok_sheets, skipped, invalid_examples = set(), [], [], []
     invalid_count = 0
     for sheet in book.worksheets():
         title = sheet.title
@@ -653,8 +562,7 @@ def read_spreadsheet(settings: Settings) -> SheetData:
                 continue
             invalid_count += 1
             if len(invalid_examples) < 20:
-                shown = " ".join(cell.split())[:80]
-                invalid_examples.append(f"лист «{title}», строка {index + 1}: {shown}")
+                invalid_examples.append(f"лист «{title}», строка {index + 1}: {' '.join(cell.split())[:80]}")
         ok_sheets.append((title, sheet_count))
     return SheetData(usernames, ok_sheets, skipped, invalid_examples, invalid_count)
 
@@ -662,29 +570,26 @@ def read_spreadsheet(settings: Settings) -> SheetData:
 def assess_sheet_safety(count: int, has_telegram_sheet: bool):
     settings = require_settings()
     if not has_telegram_sheet or count == 0:
-        return False, "Список ников пустой. Это похоже на ошибку чтения, поэтому блокировать нельзя."
+        return False, "Список ников пустой. Блокировать нельзя."
     previous = meta_get("last_good_username_count")
     if previous is None:
         return True, ""
     previous_count = int(previous)
     if previous_count >= settings.shrink_min_previous and count < previous_count * settings.shrink_ratio:
         return False, (
-            f"В таблице {count} ников, а в прошлый успешный раз было {previous_count}. "
-            "Список резко уменьшился, поэтому блокировать нельзя."
+            f"В таблице {count} ников, а раньше было {previous_count}. "
+            "Список резко уменьшился, блокировать нельзя."
         )
     return True, ""
 
 
 def chunks(text: str, limit: int = 3500) -> list:
-    parts = []
-    current = []
-    size = 0
+    parts, current, size = [], [], 0
     for line in text.split("\n"):
         extra = len(line) + 1
         if current and size + extra > limit:
             parts.append("\n".join(current))
-            current = [line]
-            size = extra
+            current, size = [line], extra
         else:
             current.append(line)
             size += extra
@@ -697,14 +602,11 @@ async def send_text(chat_id: int, text: str) -> None:
     text = text.strip()
     if not text:
         return
-    bot = require_bot()
     for part in chunks(text):
         try:
-            await bot.send_message(chat_id, part)
+            await require_bot().send_message(chat_id, part)
         except TelegramAPIError as exc:
             logging.error("Не смогла отправить сообщение в %s: %s", chat_id, safe_err(exc))
-            if "forbidden" in str(exc).lower() or "chat not found" in str(exc).lower():
-                logging.error("Откройте бота в личке и нажмите Start.")
             return
         await asyncio.sleep(0.2)
 
@@ -725,19 +627,8 @@ async def inspect_group(group_id: int, allowed: set) -> GroupReport:
     try:
         chat = await bot.get_chat(group_id)
     except TelegramAPIError as exc:
-        return GroupReport(
-            chat_id=group_id,
-            title=str(group_id),
-            is_supergroup=False,
-            is_test=False,
-            access_error=f"Не могу открыть группу. Бот должен быть в ней администратором. {safe_err(exc)}",
-        )
-    report = GroupReport(
-        chat_id=group_id,
-        title=chat.title or str(group_id),
-        is_supergroup=chat.type == ChatType.SUPERGROUP,
-        is_test=is_test_title(chat.title),
-    )
+        return GroupReport(group_id, str(group_id), False, False, f"Не могу открыть группу. {safe_err(exc)}")
+    report = GroupReport(group_id, chat.title or str(group_id), chat.type == ChatType.SUPERGROUP, is_test_title(chat.title))
     for row in get_members(group_id):
         if not row["is_member"]:
             continue
@@ -752,14 +643,7 @@ async def inspect_group(group_id: int, allowed: set) -> GroupReport:
         name = full_name(user)
         active = is_active(live)
         admin = is_admin_status(live)
-        set_member_state(
-            group_id,
-            user.id,
-            username=username,
-            name=name,
-            is_member=active,
-            is_admin=admin,
-        )
+        set_member_state(group_id, user.id, username, name, active, admin)
         if not active or user.is_bot:
             continue
         if admin:
@@ -777,11 +661,10 @@ async def inspect_group(group_id: int, allowed: set) -> GroupReport:
         pretty = format_user(username, user.id, name)
         if username in allowed:
             report.matched_names.append(pretty)
-            continue
-        if in_grace(row["joined_at"], settings.grace_hours):
+        elif in_grace(row["joined_at"], settings.grace_hours):
             report.grace.append(pretty)
-            continue
-        report.to_ban.append(PlannedBan(group_id, user.id, username, name))
+        else:
+            report.to_ban.append(PlannedBan(group_id, user.id, username, name))
         await asyncio.sleep(0.03)
     return report
 
@@ -791,76 +674,57 @@ async def execute_bans(bans: list):
     bot = require_bot()
     if not settings.bans_enabled:
         return [], [], len(bans)
-    done = []
-    failed = []
-    batch = bans[: settings.max_bans_per_run]
+    done, failed = [], []
+    batch = bans[:settings.max_bans_per_run]
     for item in batch:
         label = format_user(item.username, item.user_id, item.full_name)
         try:
             fresh = await bot.get_chat_member(item.chat_id, item.user_id)
         except TelegramAPIError as exc:
-            failed.append(f"{label}: не удалось перепроверить ({safe_err(exc)})")
+            failed.append(f"{label}: {safe_err(exc)}")
             continue
         current_username = (fresh.user.username or "").lower()
         if (
-            not is_active(fresh)
-            or is_admin_status(fresh)
-            or fresh.user.is_bot
+            not is_active(fresh) or is_admin_status(fresh) or fresh.user.is_bot
             or fresh.user.id in {settings.report_chat_id, BOT_ID}
             or current_username != item.username
         ):
-            failed.append(f"{label}: перед блокировкой статус изменился, пропустила")
+            failed.append(f"{label}: статус изменился, пропустила")
             continue
         try:
             await bot.ban_chat_member(item.chat_id, item.user_id, revoke_messages=False)
         except TelegramAPIError as exc:
             failed.append(f"{label}: {safe_err(exc)}")
             continue
-        set_member_state(
-            item.chat_id,
-            item.user_id,
-            username=current_username,
-            name=item.full_name,
-            is_member=False,
-            is_admin=False,
-        )
+        set_member_state(item.chat_id, item.user_id, current_username, item.full_name, False, False)
         done.append(label)
-        logging.info("Заблокирован user=%s chat=%s", item.user_id, item.chat_id)
         await asyncio.sleep(0.5)
-    left = max(0, len(bans) - len(batch))
-    return done, failed, left
+    return done, failed, max(0, len(bans) - len(batch))
 
 
 async def chat_still_allowed(chat_id: int) -> bool:
     settings = require_settings()
     try:
         chat = await require_bot().get_chat(chat_id)
-    except TelegramAPIError as exc:
-        logging.error("Группа %s недоступна: %s", chat_id, safe_err(exc))
+    except TelegramAPIError:
         return False
     if chat.type != ChatType.SUPERGROUP:
         return False
-    if settings.allow_non_test:
-        return True
-    return is_test_title(chat.title)
+    return settings.allow_non_test or is_test_title(chat.title)
 
 
 async def send_ban_prompt(token: str, count: int) -> None:
-    settings = require_settings()
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"Заблокировать: {count}", callback_data=f"ban:ok:{token}")],
-            [InlineKeyboardButton(text="Не блокировать", callback_data=f"ban:no:{token}")],
-        ]
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Заблокировать: {count}", callback_data=f"ban:ok:{token}")],
+        [InlineKeyboardButton(text="Не блокировать", callback_data=f"ban:no:{token}")],
+    ])
     text = (
-        f"В отчёте {count} человек.\n"
-        "Никто не заблокирован.\n"
+        f"В отчёте {count} человек.\nНикто не заблокирован.\n"
         "Блокировка начнётся только после кнопки «Заблокировать».\n"
         "Кнопка работает 24 часа и только в этом чате."
     )
     try:
-        await require_bot().send_message(settings.report_chat_id, text, reply_markup=keyboard)
+        await require_bot().send_message(require_settings().report_chat_id, text, reply_markup=keyboard)
     except TelegramAPIError as exc:
         logging.error("Не отправила кнопки: %s", safe_err(exc))
 
@@ -873,31 +737,25 @@ async def apply_confirmation(token) -> None:
         return
     if not pending_fresh(data):
         clear_pending()
-        await send_text(settings.report_chat_id, "Прошло больше 24 часов. Никого не блокирую. Напишите: проверка")
+        await send_text(settings.report_chat_id, "Прошло больше 24 часов. Никого не блокирую.")
         return
     if not settings.bans_enabled:
         await send_text(settings.report_chat_id, "Баны выключены. Никого не блокирую.")
         return
     if check_lock.locked():
-        await send_text(settings.report_chat_id, "Проверка уже идёт. Подождите минуту и нажмите кнопку ещё раз.")
+        await send_text(settings.report_chat_id, "Проверка уже идёт. Подождите и нажмите ещё раз.")
         return
     async with check_lock:
         try:
             sheet = read_spreadsheet(settings)
         except Exception as exc:
-            await send_text(
-                settings.report_chat_id,
-                "Таблицу не удалось перечитать. Никого не блокирую.\n" + safe_err(exc),
-            )
+            await send_text(settings.report_chat_id, "Таблицу не удалось перечитать. Никого не блокирую.\n" + safe_err(exc))
             return
         safe, safety_text = assess_sheet_safety(len(sheet.usernames), bool(sheet.ok_sheets))
         if not safe:
             await send_text(settings.report_chat_id, "Никого не блокирую.\n" + safety_text)
             return
-        allowed_chats = {}
-        bans = []
-        skipped_sheet = 0
-        skipped_chat = 0
+        allowed_chats, bans, skipped_sheet, skipped_chat = {}, [], 0, 0
         for item in pending_to_bans(data):
             if item.username in sheet.usernames or item.username in settings.whitelist:
                 skipped_sheet += 1
@@ -917,7 +775,7 @@ async def apply_confirmation(token) -> None:
         add_list(lines, f"Заблокированы: {len(done)}", done, 50)
         add_list(lines, f"Не удалось заблокировать: {len(failed)}", failed, 50)
         if left:
-            lines.append(f"Из-за ограничения ещё {left} человек не трогала. Напишите: проверка")
+            lines.append(f"Ещё {left} человек оставлены на следующую проверку.")
         if skipped_sheet:
             lines.append(f"Уже есть в таблице, не трогала: {skipped_sheet}")
         if skipped_chat:
@@ -947,7 +805,7 @@ def group_lines(group: GroupReport) -> list:
     lines.append(f"Сейчас видит в чате: {group.known}")
     lines.append(f"Администраторы, их не трогаю: {group.admins}")
     if group.protected:
-        lines.append(f"Дополнительно защищены от блокировки: {group.protected}")
+        lines.append(f"Дополнительно защищены: {group.protected}")
     if len(group.matched_names) <= 15:
         add_list(lines, f"Есть в таблице: {len(group.matched_names)}", group.matched_names)
     else:
@@ -956,10 +814,7 @@ def group_lines(group: GroupReport) -> list:
     add_list(lines, "Вступили недавно, их не трогаю:", group.grace)
     add_list(lines, "Не удалось перепроверить, их не трогаю:", group.unchecked)
     if group.known == 0 and not group.unchecked:
-        lines.append(
-            "Бот ещё никого не запомнил. Напишите в этой группе обычное сообщение "
-            "со своего аккаунта. Бот в группе отвечать не будет. Затем напишите мне: проверка"
-        )
+        lines.append("Бот ещё никого не запомнил. Можно прислать сюда файл members.csv.")
     return lines
 
 
@@ -967,80 +822,53 @@ async def do_check(reason: str) -> None:
     settings = require_settings()
     proposal = None
     lines = [f"Проверка {local_now_text()} ({reason})"]
-    if settings.bans_enabled:
-        lines.append("Баны включены, но сами не выполняются. Нужна ваша кнопка.")
-    else:
-        lines.append("Баны выключены. Это только отчёт, никого не блокирую.")
+    lines.append(
+        "Баны включены, но сами не выполняются. Нужна ваша кнопка."
+        if settings.bans_enabled else
+        "Баны выключены. Это только отчёт, никого не блокирую."
+    )
     if not settings.allow_non_test:
-        lines.append("Рабочий чат компании не подключён. Для блокировки название группы должно содержать «тест».")
+        lines.append("Для блокировки название группы должно содержать «тест».")
     lines.append("")
     try:
         data = read_spreadsheet(settings)
     except SpreadsheetNotFound:
         clear_pending()
-        await send_text(settings.report_chat_id, "\n".join(lines) + "\n\nТаблица по этому номеру не найдена. Никого не блокирую.")
+        await send_text(settings.report_chat_id, "\n".join(lines) + "\n\nТаблица не найдена. Никого не блокирую.")
         return
     except APIError as exc:
         clear_pending()
-        text = str(exc).lower()
-        if "403" in text or "permission" in text:
-            details = "Нет доступа к таблице. Адрес sheets-reader должен быть читателем."
-        else:
-            details = safe_err(exc)
+        details = "Нет доступа к таблице." if "403" in str(exc).lower() or "permission" in str(exc).lower() else safe_err(exc)
         await send_text(settings.report_chat_id, "\n".join(lines) + f"\n\nТаблица не открылась. Никого не блокирую.\n{details}")
         return
     safe, safety_text = assess_sheet_safety(len(data.usernames), bool(data.ok_sheets))
     lines.append(f"В таблице уникальных ников: {len(data.usernames)}")
-    lines.append("Числа по листам могут повторять одного человека. В общем числе он один.")
     lines.append("Листы:")
-    if data.ok_sheets:
-        for title, count in data.ok_sheets:
-            lines.append(f"— {title}: {count}")
-    else:
-        lines.append("— нет листа со столбцом Telegram")
+    lines.extend([f"— {title}: {count}" for title, count in data.ok_sheets] or ["— нет листа со столбцом Telegram"])
     if data.skipped_sheets:
         lines.append("Пропущены:")
-        for title in data.skipped_sheets:
-            lines.append(f"— {title}")
+        lines.extend(f"— {title}" for title in data.skipped_sheets)
     lines.append(f"Ячеек, которые не похожи на ник: {data.invalid_count}")
     add_list(lines, "Примеры таких ячеек:", data.invalid_examples, 20)
-    lines.append("Почты и фамилии не сохраняю и в отчёт не беру.")
     if safety_text:
         lines.append(safety_text)
-    if settings.whitelist:
-        whitelist = ", ".join(f"@{item}" for item in sorted(settings.whitelist))
-        lines.append(f"Исключения: {whitelist}")
-
-    groups = []
+    groups, eligible = [], []
     for group_id in settings.group_ids:
-        groups.append(await inspect_group(group_id, data.usernames))
-        lines.extend(group_lines(groups[-1]))
-
-    eligible = []
-    for group in groups:
+        group = await inspect_group(group_id, data.usernames)
+        groups.append(group)
+        lines.extend(group_lines(group))
         lines.append("")
         if group.to_ban:
             names = [format_user(item.username, item.user_id, item.full_name) for item in group.to_ban]
-            if settings.bans_enabled:
-                title = "Ждут вашего подтверждения:"
-            else:
-                title = "Попали бы под блокировку:"
-            add_list(lines, title, names, 100)
+            add_list(lines, "Ждут вашего подтверждения:" if settings.bans_enabled else "Попали бы под блокировку:", names, 100)
         else:
             lines.append(f"В «{group.title}» среди тех, кого бот видит, лишних нет.")
-        group_allowed = (
-            group.access_error is None
-            and group.is_supergroup
-            and (group.is_test or settings.allow_non_test)
-        )
-        if group_allowed:
+        if group.access_error is None and group.is_supergroup and (group.is_test or settings.allow_non_test):
             eligible.extend(group.to_ban)
-
     lines.append("")
     if not settings.bans_enabled:
         clear_pending()
         lines.append("Блокировка не выполнялась: баны выключены.")
-        lines.append("Когда баны включим, бот всё равно будет ждать вашу кнопку.")
     elif not safe:
         clear_pending()
         lines.append("Кнопку не присылаю: таблица выглядит подозрительно.")
@@ -1052,23 +880,11 @@ async def do_check(reason: str) -> None:
         save_pending(token, eligible)
         shown = min(len(eligible), settings.max_bans_per_run)
         proposal = (token, shown)
-        lines.append(f"Можно заблокировать после вашей кнопки: {shown}.")
-        lines.append("Сейчас никто не заблокирован.")
-        if len(eligible) > shown:
-            lines.append(f"Остальные {len(eligible) - shown} останутся на следующую проверку.")
+        lines.append(f"Можно заблокировать после вашей кнопки: {shown}. Сейчас никто не заблокирован.")
     if safe:
         meta_set("last_good_username_count", str(len(data.usernames)))
     weekday = WEEKDAY_RU[settings.check_weekday]
-    lines.append(
-        f"Следующая автопроверка: {weekday}, {settings.check_hour:02d}:{settings.check_minute:02d} ({settings.timezone})."
-    )
-    lines.append("Раньше можно написать мне слово: проверка")
-    logging.info(
-        "Проверка завершена: ников=%s кандидатов=%s баны=%s",
-        len(data.usernames),
-        len(eligible),
-        settings.bans_enabled,
-    )
+    lines.append(f"Следующая автопроверка: {weekday}, {settings.check_hour:02d}:{settings.check_minute:02d}.")
     await send_text(settings.report_chat_id, "\n".join(lines))
     if proposal:
         await send_ban_prompt(proposal[0], proposal[1])
@@ -1076,103 +892,60 @@ async def do_check(reason: str) -> None:
 
 async def run_check(reason: str) -> None:
     if check_lock.locked():
-        logging.info("Проверка уже идёт, пропуск: %s", reason)
         if reason == "по запросу":
-            await send_text(require_settings().report_chat_id, "Проверка уже идёт. Подождите минуту и напишите ещё раз.")
+            await send_text(require_settings().report_chat_id, "Проверка уже идёт. Подождите минуту.")
         return
     async with check_lock:
         try:
             await do_check(reason)
         except Exception as exc:
             logging.exception("Проверка сломалась")
-            await send_text(
-                require_settings().report_chat_id,
-                "Проверка не выполнилась. Никого не блокирую.\n" + safe_err(exc),
-            )
+            await send_text(require_settings().report_chat_id, "Проверка не выполнилась. Никого не блокирую.\n" + safe_err(exc))
 
 
 def command_name(text: str) -> str:
     value = text.strip().lower()
     if value.startswith("/"):
         value = value[1:].split()[0].split("@")[0]
-    aliases = {
-        "start": "help",
-        "help": "help",
-        "помощь": "help",
-        "report": "check",
-        "check": "check",
-        "проверка": "check",
-        "проверить": "check",
-        "отчет": "check",
-        "отчёт": "check",
-        "members": "members",
-        "участники": "members",
-        "база": "members",
-        "status": "status",
-        "статус": "status",
-        "баны": "status",
-        "подтвердить": "confirm",
-        "подтверждаю": "confirm",
-        "отмена": "cancel",
-        "отменить": "cancel",
-        "не блокировать": "cancel",
-    }
-    return aliases.get(value, value)
+    return {
+        "start": "help", "help": "help", "помощь": "help",
+        "report": "check", "check": "check", "проверка": "check", "проверить": "check",
+        "отчет": "check", "отчёт": "check",
+        "members": "members", "участники": "members", "база": "members",
+        "status": "status", "статус": "status", "баны": "status",
+        "подтвердить": "confirm", "подтверждаю": "confirm",
+        "отмена": "cancel", "отменить": "cancel",
+    }.get(value, value)
 
 
 async def send_help() -> None:
     settings = require_settings()
-    if settings.bans_enabled:
-        mode = "включены, но блокировка только после вашей кнопки"
-    else:
-        mode = "выключены, никто не блокируется"
-    await send_text(
-        settings.report_chat_id,
-        "\n".join(
-            [
-                f"Баны сейчас {mode}.",
-                "В группе бот молчит. Отчёт приходит только сюда.",
-                "",
-                "Напишите одно слово:",
-                "проверка — прочитать таблицу",
-                "участники — кого бот уже запомнил",
-                "статус — включены ли баны",
-                "подтвердить — то же, что кнопка «Заблокировать»",
-                "отмена — отменить предложение",
-            ]
-        ),
-    )
+    mode = "включены, но только после вашей кнопки" if settings.bans_enabled else "выключены"
+    await send_text(settings.report_chat_id, "\n".join([
+        f"Баны сейчас {mode}.",
+        "проверка — сверить таблицу",
+        "участники — кого бот запомнил",
+        "статус — включены ли баны",
+        "Файл members.csv можно прислать сюда файлом.",
+    ]))
 
 
 async def send_status() -> None:
     settings = require_settings()
-    groups = ", ".join(str(group_id) for group_id in settings.group_ids)
-    weekday = WEEKDAY_RU[settings.check_weekday]
-    if settings.bans_enabled:
-        mode = "Баны включены, но только после вашей кнопки."
-    else:
-        mode = "Баны выключены. Никто не блокируется."
-    lines = [
-        mode,
-        f"Группы: {groups}",
-        f"Отчёты приходят сюда: {settings.report_chat_id}",
-        f"Автопроверка: {weekday}, {settings.check_hour:02d}:{settings.check_minute:02d} ({settings.timezone}).",
-        "Можно проверять группы без слова «тест»."
-        if settings.allow_non_test
-        else "Группу без слова «тест» в названии бот не заблокирует.",
-    ]
-    await send_text(settings.report_chat_id, "\n".join(lines))
+    await send_text(settings.report_chat_id, "\n".join([
+        "Баны включены, но только после вашей кнопки." if settings.bans_enabled else "Баны выключены.",
+        f"Группы: {', '.join(str(item) for item in settings.group_ids)}",
+        f"Автопроверка: {WEEKDAY_RU[settings.check_weekday]}, {settings.check_hour:02d}:{settings.check_minute:02d}.",
+    ]))
 
 
 async def send_members() -> None:
     settings = require_settings()
-    lines = ["Кого бот запомнил:"]
-    total = 0
+    lines, total = ["Кого бот запомнил:"], 0
     for group_id in settings.group_ids:
         rows = get_members(group_id)
         total += len(rows)
-        lines.append("")
-        lines.append(f"Группа {group_id}: {len(rows)}")
+        lines.extend(["", f"Группа {group_id}: {len(rows)}"])
         for row in rows[:80]:
             state = "в чате" if row["is_member"] else "уже не в чате"
             if row["is_admin"]:
@@ -1181,9 +954,55 @@ async def send_members() -> None:
         if len(rows) > 80:
             lines.append(f"— и ещё {len(rows) - 80}")
     if total == 0:
-        lines.append("")
-        lines.append("Пока пусто. Напишите обычное сообщение в тестовой группе, затем снова: участники")
+        lines.append("\nПока пусто. Пришлите сюда файл members.csv.")
     await send_text(settings.report_chat_id, "\n".join(lines))
+
+
+async def import_members_file(message: Message) -> None:
+    settings = require_settings()
+    document = message.document
+    name = (document.file_name or "").lower()
+    if not name.endswith(".csv"):
+        await message.answer("Нужен файл с именем members.csv.")
+        return
+    if document.file_size and document.file_size > 2_000_000:
+        await message.answer("Файл слишком большой. Никого не записываю.")
+        return
+    buffer = io.BytesIO()
+    await message.bot.download(document, destination=buffer)
+    try:
+        text = buffer.getvalue().decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
+    except UnicodeError:
+        await message.answer("Файл не читается. Никого не записываю.")
+        return
+    imported, skipped = 0, 0
+    seen = set()
+    for row in reader:
+        if imported + skipped >= 5000:
+            break
+        try:
+            user_id = int(str(row.get("user_id", "")).strip())
+            chat_id = int(str(row.get("chat_id", "")).strip())
+        except ValueError:
+            skipped += 1
+            continue
+        if user_id <= 0 or chat_id not in settings.group_ids or (chat_id, user_id) in seen:
+            skipped += 1
+            continue
+        seen.add((chat_id, user_id))
+        remember(
+            chat_id,
+            SimpleUser(user_id, row.get("username"), row.get("first_name"), row.get("last_name")),
+            is_member=True,
+            is_admin=None,
+            joined_now=False,
+        )
+        imported += 1
+    await message.answer(
+        f"Запомнила людей: {imported}. Пропущено строк: {skipped}.\n"
+        "Никого не блокирую. Напишите: участники"
+    )
 
 
 async def handle_private(message: Message) -> None:
@@ -1192,6 +1011,9 @@ async def handle_private(message: Message) -> None:
         return
     if message.from_user.id != settings.report_chat_id:
         await message.answer("Этот бот отвечает только администратору.")
+        return
+    if message.document is not None:
+        await import_members_file(message)
         return
     if not message.text:
         await message.answer("Напишите слово: проверка")
@@ -1218,25 +1040,13 @@ def handle_group_message(message: Message) -> None:
     if message.chat.id not in settings.group_ids:
         return
     if message.left_chat_member is not None:
-        remember(
-            message.chat.id,
-            message.left_chat_member,
-            is_member=False,
-            is_admin=None,
-            joined_now=False,
-        )
+        remember(message.chat.id, message.left_chat_member, False, None, False)
         return
     if message.new_chat_members:
         for user in message.new_chat_members:
-            remember(message.chat.id, user, is_member=True, is_admin=False, joined_now=True)
+            remember(message.chat.id, user, True, False, True)
     if message.from_user is not None:
-        remember(
-            message.chat.id,
-            message.from_user,
-            is_member=True,
-            is_admin=None,
-            joined_now=False,
-        )
+        remember(message.chat.id, message.from_user, True, None, False)
 
 
 @dp.message()
@@ -1265,25 +1075,22 @@ async def on_callback(query: CallbackQuery) -> None:
             await cancel_confirmation(data.split(":", 2)[2])
     except Exception:
         logging.exception("Ошибка кнопки")
-        await send_text(require_settings().report_chat_id, "Кнопка не сработала. Никого не блокирую.")
 
 
 @dp.chat_member()
 async def on_chat_member(event: ChatMemberUpdated) -> None:
     try:
-        settings = require_settings()
-        if event.chat.id not in settings.group_ids:
+        if event.chat.id not in require_settings().group_ids:
             return
         member = event.new_chat_member
         if member.user.is_bot:
             return
-        joined_now = is_active(member) and not is_active(event.old_chat_member)
         remember(
             event.chat.id,
             member.user,
-            is_member=is_active(member),
-            is_admin=is_admin_status(member),
-            joined_now=joined_now,
+            is_active(member),
+            is_admin_status(member),
+            is_active(member) and not is_active(event.old_chat_member),
         )
     except Exception:
         logging.exception("Ошибка события участника")
@@ -1294,16 +1101,10 @@ async def on_my_chat_member(event: ChatMemberUpdated) -> None:
     try:
         settings = require_settings()
         title = event.chat.title or "без названия"
-        status = event.new_chat_member.status
         if event.chat.id in settings.group_ids:
-            text = f"Статус бота в подключённой группе «{title}» ({event.chat.id}): {status}."
+            text = f"Статус бота в «{title}»: {event.new_chat_member.status}."
         elif event.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
-            text = (
-                f"Бота добавили в группу «{title}».\n"
-                f"Её номер: {event.chat.id}.\n"
-                "Эта группа пока не подключена: бот её не проверяет и никого там не блокирует.\n"
-                "Если это рабочий чат компании, удалите оттуда бота до конца теста."
-            )
+            text = f"Бота добавили в «{title}», номер {event.chat.id}. Эта группа не подключена."
         else:
             return
         await send_text(settings.report_chat_id, text)
@@ -1311,59 +1112,22 @@ async def on_my_chat_member(event: ChatMemberUpdated) -> None:
         logging.exception("Ошибка статуса бота")
 
 
-def startup_text(username) -> str:
-    name = f"@{username}" if username else "Бот"
-    return "\n".join(
-        [
-            f"{name} запущен.",
-            "Баны выключены: никого не блокирую.",
-            "Даже после включения банов блокировка будет только по вашей кнопке.",
-            "Рабочий чат компании не подключён.",
-            "",
-            "Сейчас пришлю первую проверку.",
-            "Потом можно писать сюда словами:",
-            "проверка — сверить таблицу",
-            "участники — кого бот уже видел",
-            "статус — включены ли баны",
-        ]
-    )
-
-
 async def scheduled_check() -> None:
-    logging.info("Запущена проверка по расписанию")
     await run_check("по расписанию")
 
 
 async def amain() -> None:
     global SETTINGS, BOT, BOT_ID
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    logging.getLogger("google").setLevel(logging.WARNING)
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
     SETTINGS = load_settings()
     init_db(SETTINGS.db_path)
     BOT = Bot(SETTINGS.bot_token)
-    try:
-        me = await BOT.get_me()
-    except Exception as exc:
-        logging.error("Токен бота не подошёл: %s", safe_err(exc))
-        raise SystemExit(1) from exc
+    me = await BOT.get_me()
     BOT_ID = me.id
-    logging.info("Бот @%s, id %s", me.username, me.id)
-    logging.info(
-        "Группы %s, отчёты %s, баны %s, Google %s",
-        SETTINGS.group_ids,
-        SETTINGS.report_chat_id,
-        SETTINGS.bans_enabled,
-        SETTINGS.google_credentials.get("client_email", ""),
-    )
     scheduler = AsyncIOScheduler(timezone=SETTINGS.tz)
     scheduler.add_job(
         scheduled_check,
-        CronTrigger(
-            day_of_week=SETTINGS.check_weekday,
-            hour=SETTINGS.check_hour,
-            minute=SETTINGS.check_minute,
-        ),
+        CronTrigger(day_of_week=SETTINGS.check_weekday, hour=SETTINGS.check_hour, minute=SETTINGS.check_minute),
         id="weekly_check",
         replace_existing=True,
         max_instances=1,
@@ -1371,19 +1135,19 @@ async def amain() -> None:
     )
     scheduler.start()
     try:
-        await BOT.set_my_commands(
-            [
-                BotCommand(command="report", description="Проверить таблицу"),
-                BotCommand(command="members", description="Кого бот уже видел"),
-                BotCommand(command="status", description="Включены ли баны"),
-            ]
-        )
-        await send_text(SETTINGS.report_chat_id, startup_text(me.username))
+        await BOT.set_my_commands([
+            BotCommand(command="report", description="Проверить таблицу"),
+            BotCommand(command="members", description="Кого бот уже видел"),
+            BotCommand(command="status", description="Включены ли баны"),
+        ])
+        await send_text(SETTINGS.report_chat_id, "\n".join([
+            f"@{me.username} запущен.",
+            "Баны выключены.",
+            "Файл members.csv теперь можно прислать сюда.",
+            "Даже после включения банов нужна ваша кнопка.",
+        ]))
         await run_check("при запуске")
-        await dp.start_polling(
-            BOT,
-            allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"],
-        )
+        await dp.start_polling(BOT, allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"])
     finally:
         scheduler.shutdown(wait=False)
         await BOT.session.close()
